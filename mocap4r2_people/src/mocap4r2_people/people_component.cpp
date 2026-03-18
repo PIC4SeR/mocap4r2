@@ -97,6 +97,7 @@ PeopleNode::PeopleNode(const rclcpp::NodeOptions & options)
   people_pub_ = create_publisher<people_msgs::msg::People>(people_topic_, 10);
   pose_array_pub_ = create_publisher<geometry_msgs::msg::PoseArray>("pose_array", 10);
   valid_map2root_ = map_frame_ == root_frame_;
+  last_valid_people_bodies_ = std::make_shared<mocap4r2_msgs::msg::RigidBodies>();
 }
 
 void
@@ -124,17 +125,46 @@ PeopleNode::rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::SharedP
       msg->rigidbodies, [this](const mocap4r2_msgs::msg::RigidBody & rb) {
         return rb.rigid_body_name.find(rigid_body_prefix_) != std::string::npos;
       });
+    
+    // mocap4r2_msgs::msg::RigidBodies::SharedPtr valid_people = std::make_shared<mocap4r2_msgs::msg::RigidBodies>();
 
-    if (people.empty()) {
+    
+    for (const auto & person : people) {
+      // Check if the mocap is publishing the person pose and is not zero  
+      tf2::Quaternion q;
+      tf2::fromMsg(person.pose.orientation, q);
+      if (q.length2() < 1e-6 ) {
+        RCLCPP_WARN(
+          get_logger(),
+          "Zero quaternion received from mocap system. Check that the person is being tracked");
+        continue;
+      }
+      // obtain the person index in valid_people
+      auto person_it = std::find_if(
+        last_valid_people_bodies_->rigidbodies.begin(), last_valid_people_bodies_->rigidbodies.end(),
+        [this, &person](const mocap4r2_msgs::msg::RigidBody & rb) {
+          return rb.rigid_body_name == person.rigid_body_name;
+        });
+
+      if (person_it == last_valid_people_bodies_->rigidbodies.end()) {
+        last_valid_people_bodies_->rigidbodies.push_back(person);
+      } else {
+        *person_it = person;
+      }
+      
+    }
+
+    if (last_valid_people_bodies_->rigidbodies.empty()) {
       RCLCPP_WARN(get_logger(), "No people found in mocap system");
       return;
     }
 
+
     auto people_msg = std::make_unique<people_msgs::msg::People>();
     auto pose_array_msg = std::make_unique<geometry_msgs::msg::PoseArray>();
 
-    for (const auto & person : people) {
-      // Check if the mocap is publishing the person pose and is not zero
+    for (const auto & person : last_valid_people_bodies_->rigidbodies) {
+      // Check if the mocap is publishing the person pose and is not zero  
       tf2::Quaternion q;
       tf2::fromMsg(person.pose.orientation, q);
       if (q.length2() < 1e-6) {

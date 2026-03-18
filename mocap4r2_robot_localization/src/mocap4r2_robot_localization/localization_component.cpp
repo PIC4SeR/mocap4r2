@@ -114,20 +114,40 @@ LocalizationNode::rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::S
       [this](const mocap4r2_msgs::msg::RigidBody & rb) {
         return rb.rigid_body_name == rigid_body_name_;
       });
+      
+    mocap4r2_msgs::msg::RigidBody::SharedPtr valid_rb;
 
-    if (robot_it == msg->rigidbodies.end()) {
+    RCLCPP_DEBUG(get_logger(), "pose x: %f, y: %f, z: %f", robot_it->pose.position.x, robot_it->pose.position.y, robot_it->pose.position.z);
+    RCLCPP_DEBUG(get_logger(), "pose qx: %f, qy: %f, qz: %f, qw: %f", robot_it->pose.orientation.x, robot_it->pose.orientation.y, robot_it->pose.orientation.z, robot_it->pose.orientation.w);   
+    RCLCPP_DEBUG(get_logger(), "is uninitialized: %d", this->is_uninitialized(robot_it->pose));
+    if (robot_it != msg->rigidbodies.end() &&
+      (this->is_uninitialized(robot_it->pose) == false))
+    {
+      RCLCPP_DEBUG(get_logger(), "Rigid body %s found in mocap system", rigid_body_name_.c_str());
+      valid_rb = std::make_shared<mocap4r2_msgs::msg::RigidBody>(*robot_it);
+      last_valid_rigid_body_ = valid_rb;
+    }
+    else if (
+      this->is_uninitialized(robot_it->pose) && last_valid_rigid_body_ != nullptr
+      )
+    {
+      RCLCPP_WARN(get_logger(), "Reusing last valid rigid body data for %s", rigid_body_name_.c_str());
+      valid_rb = last_valid_rigid_body_;
+    }
+    else
+    {
       RCLCPP_WARN(get_logger(), "Rigid body %s not found in mocap system", rigid_body_name_.c_str());
       return;
     }
 
     // Check if the mocap is publishing the robot pose and is not zero
     tf2::Quaternion q;
-    tf2::fromMsg(robot_it->pose.orientation, q);
+    tf2::fromMsg(valid_rb->pose.orientation, q);
     if (q.length2() < 1e-6) {
       RCLCPP_WARN(get_logger(), "Zero quaternion received from mocap system. Check that the robot is being tracked");
       return;
     }
-    root2mocap_.setOrigin(tf2::Vector3(robot_it->pose.position.x, robot_it->pose.position.y, robot_it->pose.position.z));
+    root2mocap_.setOrigin(tf2::Vector3(valid_rb->pose.position.x, valid_rb->pose.position.y, valid_rb->pose.position.z));
     root2mocap_.setRotation(q);
 
     tf2::Transform map2odom, map2robot;
@@ -157,9 +177,8 @@ LocalizationNode::rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::S
     map2odom_msg.header.stamp = msg->header.stamp;
     map2odom_msg.child_frame_id = odom_frame_;
     map2odom_msg.transform = tf2::toMsg(map2odom);
-
     odometry_pub_->publish(std::move(odom_msg));
-    tf_broadcaster_->sendTransform(map2odom_msg);
+    tf_broadcaster_->sendTransform(map2odom_msg);   
   }
 }
 

@@ -70,6 +70,7 @@ protected:
 
   std::string root_frame_;
   std::string map_frame_;
+  mocap4r2_msgs::msg::RigidBodies::SharedPtr last_valid_people_bodies_;
 
   std::string rigid_body_topic_;
   std::string rigid_body_prefix_;

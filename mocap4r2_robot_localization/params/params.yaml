@@ -1,15 +1,16 @@
-mocap4r2_robot_localization:
-  ros__parameters:
-    root_frame: 'mocap'
-    map_frame: 'map'
-    odom_frame: 'odom'
-    robot_frame: 'base_link'
-    mocap_frame: 'base_mocap'
-    rigid_body_name: 'jackal_aligned.jackal_aligned'
-    rigid_body_topic: '/rigid_bodies'
-    odometry_topic: '/vicon/odom'
-    init_root2map_xyzrpy: [2.2078, 1.791, 0.0, 0.0, 0.0, 0.0] # for the covivio-v1 map
-    covariance:
-      pose: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
-      twist: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
-    # alpha: 0.1 # for exponential moving average
+/**:
+  mocap4r2_robot_localization:
+    ros__parameters:
+      root_frame: 'mocap'
+      map_frame: 'map'
+      odom_frame: 'odom'
+      robot_frame: 'base_link'
+      mocap_frame: 'base_mocap_link'
+      rigid_body_name: 'Jackal.Jackal'
+      rigid_body_topic: '/rigid_bodies'
+      odometry_topic: '/vicon/odom'
+      init_root2map_xyzrpy: [2.2078, 1.791, 0.0, 0.0, 0.0, 0.0] # for the covivio-v1 map
+      covariance:
+        pose: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+        twist: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+      # alpha: 0.1 # for exponential moving average

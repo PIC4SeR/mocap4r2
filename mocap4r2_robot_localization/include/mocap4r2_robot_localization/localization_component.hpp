@@ -26,6 +26,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 
 #include <vector>
+#include <boost/optional.hpp>
 
 #include "mocap4r2_msgs/msg/rigid_bodies.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -42,6 +43,13 @@ protected:
   void rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::SharedPtr msg);
 
   geometry_msgs::msg::Pose get_pose_from_vector(const std::vector<double> & init_pos);
+
+  inline bool is_uninitialized(const geometry_msgs::msg::Pose & pose)
+  {
+    return pose.position.x == 0.0 && pose.position.y == 0.0 && pose.position.z == 0.0 &&
+           pose.orientation.x == 0.0 && pose.orientation.y == 0.0 && pose.orientation.z == 0.0 &&
+           pose.orientation.w == 0.0;
+  }
 
   void compute_odometry(
     const tf2::Transform & root2robot_tf,
@@ -60,10 +68,15 @@ protected:
   std::string map_frame_;
   std::string odom_frame_;
   std::string mocap_frame_;
+  nav_msgs::msg::Odometry::SharedPtr last_valid_odom_ = nullptr;
+  rclcpp::Time last_msg_time_;
+   // Timeout period (e.g. 2 seconds)
+  rclcpp::TimerBase::SharedPtr odom_timer_;
 
   std::string rigid_body_topic_;
   std::string rigid_body_name_;
   std::string odometry_topic_;
+  mocap4r2_msgs::msg::RigidBody::SharedPtr last_valid_rigid_body_;
 
   tf2::Transform root2map_, map2root_; // root is the frame of the mocap system (in this case the origin of the vicon system)
   tf2::Transform mocap2robot_; // mocap is the frame of the mocap object robot is the base_link of the robot

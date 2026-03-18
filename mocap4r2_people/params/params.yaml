@@ -1,14 +1,15 @@
-mocap4r2_people:
-  ros__parameters:
-    root_frame: 'mocap'
-    map_frame: 'map'
-    rigid_body_prefix: 'U_'
-    rigid_body_topic: '/rigid_bodies'
-    people_topic: '/vicon/people'
-    alpha: 0.1
-    publish_map: false
-    init_root2map_xyzrpy: [2.2078, 1.791, 0.0, 0.0, 0.0, 0.0] # for the covivio-v1 map
-    tag:
-      id: 0
-      group_id: -1
-      behavior: 2
+/**:
+  mocap4r2_people:
+    ros__parameters:
+      root_frame: 'mocap'
+      map_frame: 'map'
+      rigid_body_prefix: 'U_'
+      rigid_body_topic: '/rigid_bodies'
+      people_topic: '/vicon/people'
+      alpha: 0.1
+      publish_map: false
+      init_root2map_xyzrpy: [2.2078, 1.791, 0.0, 0.0, 0.0, 0.0] # for the covivio-v1 map
+      tag:
+        id: 0
+        group_id: -1
+        behavior: 2

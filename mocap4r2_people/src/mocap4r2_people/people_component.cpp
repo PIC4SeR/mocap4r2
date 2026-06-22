@@ -19,6 +19,8 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2/utils.h>
 
+#include <cmath>
+#include <string>
 #include <vector>
 #include <ranges>
 
@@ -50,6 +52,9 @@ PeopleNode::PeopleNode(const rclcpp::NodeOptions & options)
   declare_parameter<int>("tag.group_id", -1);
   declare_parameter<int>("tag.behaviour", 2);
   declare_parameter<double>("alpha", 0.1);
+  declare_parameter<std::string>("velocity_filter", "ema");
+  declare_parameter<double>("kalman_process_noise", 1.0);
+  declare_parameter<double>("kalman_measurement_noise", 1e-4);
   declare_parameter<bool>("publish_map", true);
   declare_parameter<std::vector<double>>("init_root2map_xyzrpy", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
   
@@ -68,6 +73,9 @@ PeopleNode::PeopleNode(const rclcpp::NodeOptions & options)
   get_parameter("rigid_body_prefix", rigid_body_prefix_);
   get_parameter("people_topic", people_topic_);
   get_parameter("alpha", alpha_);
+  get_parameter("velocity_filter", velocity_filter_);
+  get_parameter("kalman_process_noise", kalman_q_);
+  get_parameter("kalman_measurement_noise", kalman_r_);
   get_parameter("publish_map", publish_map_);
   std::vector<double> init_root2map_coordinates;
   get_parameter("init_root2map_xyzrpy", init_root2map_coordinates);
@@ -263,61 +271,93 @@ void PeopleNode::compute_velocity(
   const std_msgs::msg::Header & header,
   people_msgs::msg::Person::UniquePtr & person_msg)
 {
-  static geometry_msgs::msg::Twist smoothed_twist;
-  tf2::Transform p1, p2;
-  // try to get the previous pose of the person from the map of poses
-  // if it is not found, return
-  rclcpp::Time t1;
-  rclcpp::Time t2 = header.stamp;
+  // Minimum dt (s) for a valid finite difference; guards against duplicate or
+  // out-of-order mocap timestamps that would otherwise blow up the velocity.
+  constexpr double kMinDt = 1e-4;
 
-  try {
-    tf2::fromMsg(prev_poses_[person_msg->name].pose, p1);
-    // update the previous pose of the person
-    t1 = prev_poses_[person_msg->name].header.stamp;
-    prev_poses_[person_msg->name].pose = person_pose;
-    prev_poses_[person_msg->name].header = header;
-  } catch (const std::out_of_range & e) {
-    RCLCPP_WARN(get_logger(), "No previous pose found for person %s", person_msg->name.c_str());
-    // add the person to the map of poses
-    prev_poses_[person_msg->name].pose = person_pose;
-    prev_poses_[person_msg->name].header = header;
+  const std::string & name = person_msg->name;
+  const rclcpp::Time t2 = header.stamp;
+
+  tf2::Quaternion q2;
+  tf2::fromMsg(person_pose.orientation, q2);
+  const double yaw2 = tf2::getYaw(q2);
+
+  // First time we see this person: seed the previous pose / filters and
+  // publish zero velocity (no baseline to differentiate against yet).
+  auto prev_it = prev_poses_.find(name);
+  if (prev_it == prev_poses_.end()) {
+    geometry_msgs::msg::PoseStamped ps;
+    ps.pose = person_pose;
+    ps.header = header;
+    prev_poses_[name] = ps;
+
+    PersonKalman & kf = kalman_[name];
+    kf.x.set_noise(kalman_q_, kalman_r_);
+    kf.y.set_noise(kalman_q_, kalman_r_);
+    kf.yaw.set_noise(kalman_q_, kalman_r_);
+    kf.x.reset(person_pose.position.x);
+    kf.y.reset(person_pose.position.y);
+    kf.yaw.reset(yaw2);
+
+    smoothed_twists_[name] = geometry_msgs::msg::Twist();
+    person_msg->velocity.x = 0.0;
+    person_msg->velocity.y = 0.0;
+    person_msg->velocity.z = 0.0;
     return;
   }
 
-  tf2::fromMsg(person_pose, p2);
+  const rclcpp::Time t1 = prev_it->second.header.stamp;
+  const double dt = (t2 - t1).seconds();
 
-  const double q1_w = p1.getRotation().w();
-  const double q1_x = p1.getRotation().x();
-  const double q1_y = p1.getRotation().y();
-  const double q1_z = p1.getRotation().z();
+  geometry_msgs::msg::Twist & twist = smoothed_twists_[name];
 
-  const double q2_w = p2.getRotation().w();
-  const double q2_x = p2.getRotation().x();
-  const double q2_y = p2.getRotation().y();
-  const double q2_z = p2.getRotation().z();
+  if (dt <= kMinDt) {
+    // Duplicate / out-of-order sample: re-publish the last estimate and keep
+    // the previous pose so the next valid sample sees the correct interval.
+    RCLCPP_WARN(
+      get_logger(), "Non-positive dt (%.6f s) for person %s; reusing last velocity",
+      dt, name.c_str());
+    person_msg->velocity.x = twist.linear.x;
+    person_msg->velocity.y = twist.linear.y;
+    person_msg->velocity.z = twist.angular.z;
+    return;
+  }
 
-  const double dt_inv = 1.0 / (t2 - t1).seconds();
+  if (velocity_filter_ == "kalman") {
+    PersonKalman & kf = kalman_[name];
+    twist.linear.x = kf.x.update(person_pose.position.x, dt);
+    twist.linear.y = kf.y.update(person_pose.position.y, dt);
+    // Unwrap the yaw measurement onto the filter's current estimate so the
+    // constant-velocity model sees a continuous angle across +/-pi.
+    const double yaw_ref = kf.yaw.position();
+    const double yaw_unwrapped = yaw_ref + std::remainder(yaw2 - yaw_ref, 2.0 * M_PI);
+    twist.angular.z = kf.yaw.update(yaw_unwrapped, dt);
+  } else {  // "ema": finite difference + per-person exponential moving average
+    tf2::Transform p1;
+    tf2::fromMsg(prev_it->second.pose, p1);
+    const double dt_inv = 1.0 / dt;
+    const tf2::Vector3 delta_trans = tf2::Vector3(
+      person_pose.position.x, person_pose.position.y, person_pose.position.z) - p1.getOrigin();
 
-  auto delta_trans = p2.getOrigin() - p1.getOrigin();
+    const double q1_w = p1.getRotation().w();
+    const double q1_x = p1.getRotation().x();
+    const double q1_y = p1.getRotation().y();
+    const double q1_z = p1.getRotation().z();
+    const double raw_wz = 2.0 * dt_inv *
+      (q1_w * q2.z() - q1_x * q2.y() + q1_y * q2.x() - q1_z * q2.w());
 
-  // Compute linear velocities
+    twist.linear.x = (1 - alpha_) * twist.linear.x + alpha_ * (delta_trans.x() * dt_inv);
+    twist.linear.y = (1 - alpha_) * twist.linear.y + alpha_ * (delta_trans.y() * dt_inv);
+    twist.angular.z = (1 - alpha_) * twist.angular.z + alpha_ * raw_wz;
+  }
 
-  // Smooth velocities with a simple low-pass filter
-  smoothed_twist.linear.x = (1 - alpha_) * smoothed_twist.linear.x + alpha_ *
-    (delta_trans.x() * dt_inv);
-  smoothed_twist.linear.y = (1 - alpha_) * smoothed_twist.linear.y + alpha_ *
-    (delta_trans.y() * dt_inv);
+  person_msg->velocity.x = twist.linear.x;
+  person_msg->velocity.y = twist.linear.y;
+  person_msg->velocity.z = twist.angular.z;
 
-  person_msg->velocity.x = smoothed_twist.linear.x;
-  person_msg->velocity.y = smoothed_twist.linear.y;
-
-
-  // Compute angular velocities
-  // smooth angular velocities with a simple low-pass filter
-  smoothed_twist.angular.z = (1 - alpha_) * smoothed_twist.angular.z + alpha_ * (
-    2.0 * dt_inv * (q1_w * q2_z - q1_x * q2_y + q1_y * q2_x - q1_z * q2_w));
-
-  person_msg->velocity.z = smoothed_twist.angular.z;
+  // Advance the previous pose only after a successful update.
+  prev_it->second.pose = person_pose;
+  prev_it->second.header = header;
 }
 
 geometry_msgs::msg::Pose

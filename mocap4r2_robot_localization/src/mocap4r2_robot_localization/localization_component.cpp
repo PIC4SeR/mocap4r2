@@ -18,8 +18,10 @@
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2/utils.h>
 #include <nav_msgs/msg/odometry.hpp>
 
+#include <cmath>
 #include <vector>
 
 #include "mocap4r2_robot_localization/localization_component.hpp"
@@ -50,6 +52,9 @@ LocalizationNode::LocalizationNode(const rclcpp::NodeOptions & options)
   declare_parameter<std::string>("odometry_topic", "odometry");
   declare_parameter<std::string>("rigid_body_name", "robot");
   declare_parameter<double>("alpha", 0.1);
+  declare_parameter<std::string>("velocity_filter", "ema");
+  declare_parameter<double>("kalman_process_noise", 1.0);
+  declare_parameter<double>("kalman_measurement_noise", 1e-4);
   declare_parameter<std::vector<double>>("init_root2map_xyzrpy", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
   declare_parameter<std::vector<double>>("covariance.pose", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
   declare_parameter<std::vector<double>>("covariance.twist", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
@@ -62,6 +67,13 @@ LocalizationNode::LocalizationNode(const rclcpp::NodeOptions & options)
   get_parameter("rigid_body_topic", rigid_body_topic_);
   get_parameter("rigid_body_name", rigid_body_name_);
   get_parameter("alpha", alpha_);
+  get_parameter("velocity_filter", velocity_filter_);
+  get_parameter("kalman_process_noise", kalman_q_);
+  get_parameter("kalman_measurement_noise", kalman_r_);
+  kf_x_.set_noise(kalman_q_, kalman_r_);
+  kf_y_.set_noise(kalman_q_, kalman_r_);
+  kf_z_.set_noise(kalman_q_, kalman_r_);
+  kf_yaw_.set_noise(kalman_q_, kalman_r_);
   get_parameter("odometry_topic", odometry_topic_);
   get_parameter("covariance.pose", pose_covariance_);
   get_parameter("covariance.twist", twist_covariance_);
@@ -208,68 +220,107 @@ LocalizationNode::get_pose_from_vector(const std::vector<double> & init_pos)
 }
 
 void LocalizationNode::compute_odometry(
-  const tf2::Transform & root2robot_tf,
+  const tf2::Transform & map2robot_tf,
   nav_msgs::msg::Odometry::UniquePtr & odom_msg)
 {
-  static geometry_msgs::msg::Twist smoothed_twist;
-  tf2::Transform p1;
-  tf2::fromMsg(prev_pose_.pose, p1);
-  tf2::toMsg(root2robot_tf, odom_msg->pose.pose);
+  // Minimum dt (s) for a valid finite difference; guards against duplicate or
+  // out-of-order mocap timestamps that would otherwise blow up the velocity.
+  constexpr double kMinDt = 1e-4;
 
-  const double q1_w = p1.getRotation().w();
-  const double q1_x = p1.getRotation().x();
-  const double q1_y = p1.getRotation().y();
-  const double q1_z = p1.getRotation().z();
+  // map-frame pose of the robot.
+  tf2::toMsg(map2robot_tf, odom_msg->pose.pose);
 
-  const double q2_w = root2robot_tf.getRotation().w();
-  const double q2_x = root2robot_tf.getRotation().x();
-  const double q2_y = root2robot_tf.getRotation().y();
-  const double q2_z = root2robot_tf.getRotation().z(); 
-  
-  rclcpp::Time t1 = prev_pose_.header.stamp;
-  rclcpp::Time t2 = odom_msg->header.stamp;
-
-  const double dt_inv = 1.0 / (t2 - t1).seconds();
-
-  auto delta_trans = tf2::quatRotate(
-    root2robot_tf.getRotation().inverse(), (root2robot_tf.getOrigin() - p1.getOrigin()));
-    
-  // Compute linear velocities
-  
-  // Smooth velocities with a simple low-pass filter
-  smoothed_twist.linear.x = (1 - alpha_) * smoothed_twist.linear.x + alpha_ * (delta_trans.x() * dt_inv);
-  smoothed_twist.linear.y = (1 - alpha_) * smoothed_twist.linear.y + alpha_ * (delta_trans.y() * dt_inv);
-  smoothed_twist.linear.z = (1 - alpha_) * smoothed_twist.linear.z + alpha_ * (delta_trans.z() * dt_inv);
-
-  odom_msg->twist.twist.linear.x = smoothed_twist.linear.x;
-  odom_msg->twist.twist.linear.y = smoothed_twist.linear.y;
-  odom_msg->twist.twist.linear.z = smoothed_twist.linear.z;
-    
-  // Compute angular velocities
-  // smooth angular velocities with a simple low-pass filter
-  smoothed_twist.angular.x = (1 - alpha_) * smoothed_twist.angular.x + alpha_ * (
-    2.0 * dt_inv * (q1_w * q2_x - q1_x * q2_w - q1_y * q2_z + q1_z * q2_y));
-  smoothed_twist.angular.y = (1 - alpha_) * smoothed_twist.angular.y + alpha_ * (
-    2.0 * dt_inv * (q1_w * q2_y + q1_x * q2_z - q1_y * q2_w - q1_z * q2_x));
-  smoothed_twist.angular.z = (1 - alpha_) * smoothed_twist.angular.z + alpha_ * (
-    2.0 * dt_inv * (q1_w * q2_z - q1_x * q2_y + q1_y * q2_x - q1_z * q2_w));
-
-  odom_msg->twist.twist.angular.x = smoothed_twist.angular.x;
-  odom_msg->twist.twist.angular.y = smoothed_twist.angular.y;
-  odom_msg->twist.twist.angular.z = smoothed_twist.angular.z;
-
-  // Fill covariances
-  for (size_t i = 0; i < 6; i++) 
-  {
+  // Fill covariances (independent of the velocity estimate).
+  for (size_t i = 0; i < 6; i++) {
     odom_msg->pose.covariance[i * 6 + i] = pose_covariance_[i];
     odom_msg->twist.covariance[i * 6 + i] = twist_covariance_[i];
   }
 
+  const rclcpp::Time t2 = odom_msg->header.stamp;
+  const tf2::Vector3 pos = map2robot_tf.getOrigin();
+  const double yaw2 = tf2::getYaw(map2robot_tf.getRotation());
+
+  // First sample: seed the previous pose / filters, publish zero velocity.
+  if (!velocity_initialized_) {
+    kf_x_.reset(pos.x());
+    kf_y_.reset(pos.y());
+    kf_z_.reset(pos.z());
+    kf_yaw_.reset(yaw2);
+    smoothed_twist_ = geometry_msgs::msg::Twist();
+    odom_msg->twist.twist = smoothed_twist_;
+    velocity_initialized_ = true;
+    prev_pose_.header = odom_msg->header;
+    prev_pose_.pose = odom_msg->pose.pose;
+    return;
+  }
+
+  const rclcpp::Time t1 = prev_pose_.header.stamp;
+  const double dt = (t2 - t1).seconds();
+
+  if (dt <= kMinDt) {
+    // Duplicate / out-of-order sample: re-publish the last estimate and keep
+    // the previous pose so the next valid sample sees the correct interval.
+    RCLCPP_WARN(
+      get_logger(), "Non-positive dt (%.6f s) for robot odometry; reusing last velocity", dt);
+    odom_msg->twist.twist = smoothed_twist_;
+    return;
+  }
+
+  if (velocity_filter_ == "kalman") {
+    // Constant-velocity Kalman on the map-frame position.
+    const double vx_map = kf_x_.update(pos.x(), dt);
+    const double vy_map = kf_y_.update(pos.y(), dt);
+    const double vz_map = kf_z_.update(pos.z(), dt);
+    // nav_msgs/Odometry twist is expressed in the child (robot) frame, so
+    // rotate the map-frame linear velocity into the body frame.
+    const tf2::Vector3 v_body = tf2::quatRotate(
+      map2robot_tf.getRotation().inverse(), tf2::Vector3(vx_map, vy_map, vz_map));
+    smoothed_twist_.linear.x = v_body.x();
+    smoothed_twist_.linear.y = v_body.y();
+    smoothed_twist_.linear.z = v_body.z();
+    // Yaw-rate from a constant-velocity Kalman on the unwrapped yaw. The roll /
+    // pitch rates are assumed negligible for a planar ground robot.
+    const double yaw_ref = kf_yaw_.position();
+    const double yaw_unwrapped = yaw_ref + std::remainder(yaw2 - yaw_ref, 2.0 * M_PI);
+    smoothed_twist_.angular.x = 0.0;
+    smoothed_twist_.angular.y = 0.0;
+    smoothed_twist_.angular.z = kf_yaw_.update(yaw_unwrapped, dt);
+  } else {  // "ema": finite difference (body frame) + exponential moving average
+    tf2::Transform p1;
+    tf2::fromMsg(prev_pose_.pose, p1);
+    const double dt_inv = 1.0 / dt;
+    const tf2::Vector3 delta_trans = tf2::quatRotate(
+      map2robot_tf.getRotation().inverse(), (map2robot_tf.getOrigin() - p1.getOrigin()));
+
+    const double q1_w = p1.getRotation().w();
+    const double q1_x = p1.getRotation().x();
+    const double q1_y = p1.getRotation().y();
+    const double q1_z = p1.getRotation().z();
+    const double q2_w = map2robot_tf.getRotation().w();
+    const double q2_x = map2robot_tf.getRotation().x();
+    const double q2_y = map2robot_tf.getRotation().y();
+    const double q2_z = map2robot_tf.getRotation().z();
+
+    smoothed_twist_.linear.x = (1 - alpha_) * smoothed_twist_.linear.x +
+      alpha_ * (delta_trans.x() * dt_inv);
+    smoothed_twist_.linear.y = (1 - alpha_) * smoothed_twist_.linear.y +
+      alpha_ * (delta_trans.y() * dt_inv);
+    smoothed_twist_.linear.z = (1 - alpha_) * smoothed_twist_.linear.z +
+      alpha_ * (delta_trans.z() * dt_inv);
+
+    smoothed_twist_.angular.x = (1 - alpha_) * smoothed_twist_.angular.x + alpha_ * (
+      2.0 * dt_inv * (q1_w * q2_x - q1_x * q2_w - q1_y * q2_z + q1_z * q2_y));
+    smoothed_twist_.angular.y = (1 - alpha_) * smoothed_twist_.angular.y + alpha_ * (
+      2.0 * dt_inv * (q1_w * q2_y + q1_x * q2_z - q1_y * q2_w - q1_z * q2_x));
+    smoothed_twist_.angular.z = (1 - alpha_) * smoothed_twist_.angular.z + alpha_ * (
+      2.0 * dt_inv * (q1_w * q2_z - q1_x * q2_y + q1_y * q2_x - q1_z * q2_w));
+  }
+
+  odom_msg->twist.twist = smoothed_twist_;
+
+  // Advance the previous pose only after a successful update.
   prev_pose_.header = odom_msg->header;
-  prev_pose_.pose.position.x = odom_msg->pose.pose.position.x;
-  prev_pose_.pose.position.y = odom_msg->pose.pose.position.y;
-  prev_pose_.pose.position.z = odom_msg->pose.pose.position.z;
-  prev_pose_.pose.orientation = odom_msg->pose.pose.orientation;
+  prev_pose_.pose = odom_msg->pose.pose;
 }
 
 }  // namespace mocap4r2_robot_localization

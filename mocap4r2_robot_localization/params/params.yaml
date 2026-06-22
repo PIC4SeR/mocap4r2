@@ -13,4 +13,10 @@
       covariance:
         pose: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
         twist: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+      # Velocity estimation: 'ema' (finite difference + exponential moving
+      # average, smoothed by alpha) or 'kalman' (constant-velocity Kalman filter
+      # on the map-frame position + yaw, tuned by the kalman_* gains below).
+      velocity_filter: 'ema'
       # alpha: 0.1 # for exponential moving average
+      kalman_process_noise: 1.0        # accel spectral density; larger = more responsive
+      kalman_measurement_noise: 0.0001  # mocap position variance (m^2); larger = smoother

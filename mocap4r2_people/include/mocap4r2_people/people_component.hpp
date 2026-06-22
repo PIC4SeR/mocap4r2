@@ -24,6 +24,8 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
+#include <map>
+#include <string>
 #include <vector>
 
 #include "mocap4r2_msgs/msg/rigid_bodies.hpp"
@@ -31,6 +33,7 @@
 #include "geometry_msgs/msg/pose_array.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "people_msgs/msg/people.hpp"
+#include "mocap4r2_people/cv_kalman.hpp"
 
 #include "rclcpp/rclcpp.hpp"
 
@@ -83,6 +86,24 @@ protected:
 
   //map of poses to keep track of the previous poses of the people
   std::map<std::string, geometry_msgs::msg::PoseStamped> prev_poses_;
+
+  // Per-person constant-velocity Kalman filters (x, y position and yaw).
+  struct PersonKalman
+  {
+    mocap4r2_filters::CVKalman1D x;
+    mocap4r2_filters::CVKalman1D y;
+    mocap4r2_filters::CVKalman1D yaw;
+  };
+  std::map<std::string, PersonKalman> kalman_;
+  // Per-person EMA / last-published twist (also reused when dt is invalid).
+  // Previously a single function-local `static`, which was shared across all
+  // people and corrupted their velocities.
+  std::map<std::string, geometry_msgs::msg::Twist> smoothed_twists_;
+
+  std::string velocity_filter_;  // "ema" (default) or "kalman"
+  double kalman_q_;              // process-noise spectral density
+  double kalman_r_;              // measurement variance
+
   double alpha_;
   bool valid_map2root_{false}, publish_map_{true};
 

@@ -24,11 +24,14 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 
+#include <string>
 #include <vector>
 #include <boost/optional.hpp>
 
 #include "mocap4r2_msgs/msg/rigid_bodies.hpp"
+#include "mocap4r2_robot_localization/cv_kalman.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 
@@ -84,6 +87,19 @@ protected:
 
   geometry_msgs::msg::PoseStamped prev_pose_;
   double alpha_;
+
+  // Velocity filtering. EMA keeps the previous behaviour (finite difference +
+  // exponential moving average); "kalman" runs constant-velocity Kalman filters
+  // on the map-frame position (x, y, z) and yaw.
+  std::string velocity_filter_;
+  double kalman_q_;
+  double kalman_r_;
+  mocap4r2_filters::CVKalman1D kf_x_;
+  mocap4r2_filters::CVKalman1D kf_y_;
+  mocap4r2_filters::CVKalman1D kf_z_;
+  mocap4r2_filters::CVKalman1D kf_yaw_;
+  geometry_msgs::msg::Twist smoothed_twist_;  // EMA / last-published twist state
+  bool velocity_initialized_{false};
 
   bool valid_mocap2robot_{false};
 

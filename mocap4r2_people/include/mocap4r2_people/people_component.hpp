@@ -69,6 +69,10 @@ protected:
 
   rclcpp::Subscription<mocap4r2_msgs::msg::RigidBodies>::SharedPtr rigid_body_sub_;
   rclcpp::Publisher<people_msgs::msg::People>::SharedPtr people_pub_;
+  // Same people but with positions coasting on the filter prediction while a
+  // detection is gated (so a label swap does not leak into the position).
+  rclcpp::Publisher<people_msgs::msg::People>::SharedPtr people_filtered_pub_;
+  std::string people_filtered_topic_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pose_array_pub_;
 
   std::string root_frame_;
@@ -87,12 +91,14 @@ protected:
   //map of poses to keep track of the previous poses of the people
   std::map<std::string, geometry_msgs::msg::PoseStamped> prev_poses_;
 
-  // Per-person constant-velocity Kalman filters (x, y position and yaw).
+  // Per-person constant-velocity Kalman filters (x, y position and yaw),
+  // plus a coast counter for the innovation gating.
   struct PersonKalman
   {
     mocap4r2_filters::CVKalman1D x;
     mocap4r2_filters::CVKalman1D y;
     mocap4r2_filters::CVKalman1D yaw;
+    int coast{0};
   };
   std::map<std::string, PersonKalman> kalman_;
   // Per-person EMA / last-published twist (also reused when dt is invalid).
@@ -103,6 +109,8 @@ protected:
   std::string velocity_filter_;  // "ema" (default) or "kalman"
   double kalman_q_;              // process-noise spectral density
   double kalman_r_;              // measurement variance
+  double kalman_gate_;          // chi-square gate on squared innovation (<=0 disables)
+  int kalman_max_coast_;        // force track re-acquire after this many gated samples
 
   double alpha_;
   bool valid_map2root_{false}, publish_map_{true};

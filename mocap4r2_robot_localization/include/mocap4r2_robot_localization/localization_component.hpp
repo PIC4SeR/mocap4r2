@@ -65,6 +65,11 @@ protected:
 
   rclcpp::Subscription<mocap4r2_msgs::msg::RigidBodies>::SharedPtr rigid_body_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
+  // Same odom but with the pose coasting on the filter prediction while a
+  // measurement is gated (so a swap/teleport does not leak into the position).
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_filtered_pub_;
+  std::string odometry_filtered_topic_;
+  geometry_msgs::msg::Pose filtered_pose_;  // coast-corrected pose for the filtered topic
 
   std::string root_frame_;
   std::string robot_frame_;
@@ -94,6 +99,9 @@ protected:
   std::string velocity_filter_;
   double kalman_q_;
   double kalman_r_;
+  double kalman_gate_;          // chi-square gate on squared innovation (<=0 disables)
+  int kalman_max_coast_;        // force re-acquire after this many gated samples
+  int coast_count_{0};          // consecutive gated/coasted samples
   mocap4r2_filters::CVKalman1D kf_x_;
   mocap4r2_filters::CVKalman1D kf_y_;
   mocap4r2_filters::CVKalman1D kf_z_;

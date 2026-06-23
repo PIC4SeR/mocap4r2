@@ -47,6 +47,7 @@ PeopleNode::PeopleNode(const rclcpp::NodeOptions & options)
   declare_parameter<std::string>("map_frame", "map");
   declare_parameter<std::string>("rigid_body_topic", "rigid_bodies");
   declare_parameter<std::string>("people_topic", "people");
+  declare_parameter<std::string>("people_filtered_topic", "/vicon/people_filtered");
   declare_parameter<std::string>("rigid_body_prefix", "person");
   declare_parameter<int>("tag.id", 0);
   declare_parameter<int>("tag.group_id", -1);
@@ -54,7 +55,9 @@ PeopleNode::PeopleNode(const rclcpp::NodeOptions & options)
   declare_parameter<double>("alpha", 0.1);
   declare_parameter<std::string>("velocity_filter", "ema");
   declare_parameter<double>("kalman_process_noise", 1.0);
-  declare_parameter<double>("kalman_measurement_noise", 1e-4);
+  declare_parameter<double>("kalman_measurement_noise", 1e-2);
+  declare_parameter<double>("kalman_gate", 0.0);
+  declare_parameter<int>("kalman_max_coast", 10);
   declare_parameter<bool>("publish_map", true);
   declare_parameter<std::vector<double>>("init_root2map_xyzrpy", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
   
@@ -72,10 +75,13 @@ PeopleNode::PeopleNode(const rclcpp::NodeOptions & options)
   get_parameter("rigid_body_topic", rigid_body_topic_);
   get_parameter("rigid_body_prefix", rigid_body_prefix_);
   get_parameter("people_topic", people_topic_);
+  get_parameter("people_filtered_topic", people_filtered_topic_);
   get_parameter("alpha", alpha_);
   get_parameter("velocity_filter", velocity_filter_);
   get_parameter("kalman_process_noise", kalman_q_);
   get_parameter("kalman_measurement_noise", kalman_r_);
+  get_parameter("kalman_gate", kalman_gate_);
+  get_parameter("kalman_max_coast", kalman_max_coast_);
   get_parameter("publish_map", publish_map_);
   std::vector<double> init_root2map_coordinates;
   get_parameter("init_root2map_xyzrpy", init_root2map_coordinates);
@@ -103,6 +109,8 @@ PeopleNode::PeopleNode(const rclcpp::NodeOptions & options)
     std::bind(&PeopleNode::rigid_bodies_callback, this, _1));
 
   people_pub_ = create_publisher<people_msgs::msg::People>(people_topic_, 10);
+  people_filtered_pub_ =
+    create_publisher<people_msgs::msg::People>(people_filtered_topic_, 10);
   pose_array_pub_ = create_publisher<geometry_msgs::msg::PoseArray>("pose_array", 10);
   valid_map2root_ = map_frame_ == root_frame_;
   last_valid_people_bodies_ = std::make_shared<mocap4r2_msgs::msg::RigidBodies>();
@@ -169,6 +177,7 @@ PeopleNode::rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::SharedP
 
 
     auto people_msg = std::make_unique<people_msgs::msg::People>();
+    auto people_filtered_msg = std::make_unique<people_msgs::msg::People>();
     auto pose_array_msg = std::make_unique<geometry_msgs::msg::PoseArray>();
 
     for (const auto & person : last_valid_people_bodies_->rigidbodies) {
@@ -214,6 +223,19 @@ PeopleNode::rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::SharedP
       auto person_msg = std::make_unique<people_msgs::msg::Person>();
       fill_person_msg(person.rigid_body_name, *person_pose, msg->header, person_msg);
 
+      // Filtered copy: while a detection is gated, coast the position on the
+      // filter prediction so a label swap does not leak into the position.
+      people_msgs::msg::Person person_filtered = *person_msg;
+      if (velocity_filter_ == "kalman") {
+        auto it = kalman_.find(person.rigid_body_name);
+        if (it != kalman_.end() && it->second.coast > 0) {
+          person_filtered.position.x = it->second.x.position();
+          person_filtered.position.y = it->second.y.position();
+          person_filtered.position.z = it->second.yaw.position();  // yaw packed in z
+        }
+      }
+      people_filtered_msg->people.push_back(std::move(person_filtered));
+
       pose_array_msg->poses.push_back(std::move(*person_pose));
       people_msg->people.push_back(std::move(*person_msg));
     }
@@ -221,7 +243,9 @@ PeopleNode::rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::SharedP
     pose_array_msg->header.frame_id = map_frame_;
     people_msg->header = msg->header;
     people_msg->header.frame_id = map_frame_;
+    people_filtered_msg->header = people_msg->header;
 
+    people_filtered_pub_->publish(std::move(people_filtered_msg));
     people_pub_->publish(std::move(people_msg));
     pose_array_pub_->publish(std::move(pose_array_msg));
   }
@@ -325,13 +349,44 @@ void PeopleNode::compute_velocity(
 
   if (velocity_filter_ == "kalman") {
     PersonKalman & kf = kalman_[name];
-    twist.linear.x = kf.x.update(person_pose.position.x, dt);
-    twist.linear.y = kf.y.update(person_pose.position.y, dt);
+    kf.x.predict(dt);
+    kf.y.predict(dt);
+    kf.yaw.predict(dt);
     // Unwrap the yaw measurement onto the filter's current estimate so the
     // constant-velocity model sees a continuous angle across +/-pi.
     const double yaw_ref = kf.yaw.position();
     const double yaw_unwrapped = yaw_ref + std::remainder(yaw2 - yaw_ref, 2.0 * M_PI);
-    twist.angular.z = kf.yaw.update(yaw_unwrapped, dt);
+
+    // Mahalanobis gate on the 2-DOF (x, y) position innovation. A label swap
+    // (this person's tag jumping onto another body or the robot) lands far from
+    // the prediction and is rejected.
+    const double d2 = kf.x.innovation_sq(person_pose.position.x) +
+      kf.y.innovation_sq(person_pose.position.y);
+    const bool gating = kalman_gate_ > 0.0;
+    if (gating && d2 > kalman_gate_ && kf.coast < kalman_max_coast_) {
+      ++kf.coast;  // reject outlier: coast on the prediction
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Gated mocap update for %s (d2=%.1f > %.1f); coasting (%d)",
+        name.c_str(), d2, kalman_gate_, kf.coast);
+    } else {
+      if (gating && kf.coast >= kalman_max_coast_ && d2 > kalman_gate_) {
+        kf.x.reset(person_pose.position.x);
+        kf.y.reset(person_pose.position.y);
+        kf.yaw.reset(yaw2);
+      } else {
+        kf.x.correct(person_pose.position.x);
+        kf.y.correct(person_pose.position.y);
+        kf.yaw.correct(yaw_unwrapped);
+      }
+      kf.coast = 0;
+    }
+    twist.linear.x = kf.x.velocity();
+    twist.linear.y = kf.y.velocity();
+    twist.angular.z = kf.yaw.velocity();
+    // Reliability reflects track health (drops while coasting on gated samples).
+    person_msg->reliability = kf.coast == 0 ? 1.0f
+      : static_cast<float>(std::max(0.1, 1.0 / (1.0 + kf.coast)));
   } else {  // "ema": finite difference + per-person exponential moving average
     tf2::Transform p1;
     tf2::fromMsg(prev_it->second.pose, p1);

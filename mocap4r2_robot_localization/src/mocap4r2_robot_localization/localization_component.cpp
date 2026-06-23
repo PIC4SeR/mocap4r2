@@ -50,11 +50,14 @@ LocalizationNode::LocalizationNode(const rclcpp::NodeOptions & options)
   declare_parameter<std::string>("mocap_frame", "base_mocap");
   declare_parameter<std::string>("rigid_body_topic", "rigid_bodies");
   declare_parameter<std::string>("odometry_topic", "odometry");
+  declare_parameter<std::string>("odometry_filtered_topic", "/vicon/odom_filtered");
   declare_parameter<std::string>("rigid_body_name", "robot");
   declare_parameter<double>("alpha", 0.1);
   declare_parameter<std::string>("velocity_filter", "ema");
   declare_parameter<double>("kalman_process_noise", 1.0);
-  declare_parameter<double>("kalman_measurement_noise", 1e-4);
+  declare_parameter<double>("kalman_measurement_noise", 1e-2);
+  declare_parameter<double>("kalman_gate", 0.0);
+  declare_parameter<int>("kalman_max_coast", 10);
   declare_parameter<std::vector<double>>("init_root2map_xyzrpy", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
   declare_parameter<std::vector<double>>("covariance.pose", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
   declare_parameter<std::vector<double>>("covariance.twist", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
@@ -70,18 +73,23 @@ LocalizationNode::LocalizationNode(const rclcpp::NodeOptions & options)
   get_parameter("velocity_filter", velocity_filter_);
   get_parameter("kalman_process_noise", kalman_q_);
   get_parameter("kalman_measurement_noise", kalman_r_);
+  get_parameter("kalman_gate", kalman_gate_);
+  get_parameter("kalman_max_coast", kalman_max_coast_);
   kf_x_.set_noise(kalman_q_, kalman_r_);
   kf_y_.set_noise(kalman_q_, kalman_r_);
   kf_z_.set_noise(kalman_q_, kalman_r_);
   kf_yaw_.set_noise(kalman_q_, kalman_r_);
   get_parameter("odometry_topic", odometry_topic_);
+  get_parameter("odometry_filtered_topic", odometry_filtered_topic_);
   get_parameter("covariance.pose", pose_covariance_);
   get_parameter("covariance.twist", twist_covariance_);
 
   rigid_body_sub_ = create_subscription<mocap4r2_msgs::msg::RigidBodies>(
     rigid_body_topic_, rclcpp::SensorDataQoS(), std::bind(&LocalizationNode::rigid_bodies_callback, this, _1));
- 
+
   odometry_pub_ = create_publisher<nav_msgs::msg::Odometry>(odometry_topic_, 10);
+  odometry_filtered_pub_ =
+    create_publisher<nav_msgs::msg::Odometry>(odometry_filtered_topic_, 10);
 
   std::vector<double> init_root2map_coordinates;
   get_parameter("init_root2map_xyzrpy", init_root2map_coordinates);
@@ -189,8 +197,14 @@ LocalizationNode::rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::S
     map2odom_msg.header.stamp = msg->header.stamp;
     map2odom_msg.child_frame_id = odom_frame_;
     map2odom_msg.transform = tf2::toMsg(map2odom);
+
+    // Filtered topic: same odometry but with the coast-corrected pose.
+    auto odom_filtered = std::make_unique<nav_msgs::msg::Odometry>(*odom_msg);
+    odom_filtered->pose.pose = filtered_pose_;
+    odometry_filtered_pub_->publish(std::move(odom_filtered));
+
     odometry_pub_->publish(std::move(odom_msg));
-    tf_broadcaster_->sendTransform(map2odom_msg);   
+    tf_broadcaster_->sendTransform(map2odom_msg);
   }
 }
 
@@ -227,8 +241,10 @@ void LocalizationNode::compute_odometry(
   // out-of-order mocap timestamps that would otherwise blow up the velocity.
   constexpr double kMinDt = 1e-4;
 
-  // map-frame pose of the robot.
+  // map-frame pose of the robot. The filtered topic uses this raw pose unless
+  // the sample is gated, in which case it coasts on the prediction (set below).
   tf2::toMsg(map2robot_tf, odom_msg->pose.pose);
+  filtered_pose_ = odom_msg->pose.pose;
 
   // Fill covariances (independent of the velocity estimate).
   for (size_t i = 0; i < 6; i++) {
@@ -267,24 +283,50 @@ void LocalizationNode::compute_odometry(
   }
 
   if (velocity_filter_ == "kalman") {
-    // Constant-velocity Kalman on the map-frame position.
-    const double vx_map = kf_x_.update(pos.x(), dt);
-    const double vy_map = kf_y_.update(pos.y(), dt);
-    const double vz_map = kf_z_.update(pos.z(), dt);
+    // Constant-velocity Kalman on the map-frame position. Predict first, then
+    // gate the (x, y) position innovation before correcting.
+    kf_x_.predict(dt);
+    kf_y_.predict(dt);
+    kf_z_.predict(dt);
+    kf_yaw_.predict(dt);
+    const double yaw_ref = kf_yaw_.position();
+    const double yaw_unwrapped = yaw_ref + std::remainder(yaw2 - yaw_ref, 2.0 * M_PI);
+
+    // Mahalanobis gate on the 2-DOF (x, y) position innovation.
+    const double d2 = kf_x_.innovation_sq(pos.x()) + kf_y_.innovation_sq(pos.y());
+    const bool gating = kalman_gate_ > 0.0;
+    if (gating && d2 > kalman_gate_ && coast_count_ < kalman_max_coast_) {
+      ++coast_count_;  // reject outlier (swap/teleport): coast on the prediction
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Gated robot mocap update (d2=%.1f > %.1f); coasting (%d)",
+        d2, kalman_gate_, coast_count_);
+    } else {
+      if (gating && coast_count_ >= kalman_max_coast_ && d2 > kalman_gate_) {
+        // Persistent outlier: the target really moved -> re-acquire the track.
+        kf_x_.reset(pos.x()); kf_y_.reset(pos.y());
+        kf_z_.reset(pos.z()); kf_yaw_.reset(yaw2);
+        RCLCPP_WARN(get_logger(), "Robot track re-acquired after %d gated samples",
+                    coast_count_);
+      } else {
+        kf_x_.correct(pos.x()); kf_y_.correct(pos.y());
+        kf_z_.correct(pos.z()); kf_yaw_.correct(yaw_unwrapped);
+      }
+      coast_count_ = 0;
+    }
+
     // nav_msgs/Odometry twist is expressed in the child (robot) frame, so
     // rotate the map-frame linear velocity into the body frame.
     const tf2::Vector3 v_body = tf2::quatRotate(
-      map2robot_tf.getRotation().inverse(), tf2::Vector3(vx_map, vy_map, vz_map));
+      map2robot_tf.getRotation().inverse(),
+      tf2::Vector3(kf_x_.velocity(), kf_y_.velocity(), kf_z_.velocity()));
     smoothed_twist_.linear.x = v_body.x();
     smoothed_twist_.linear.y = v_body.y();
     smoothed_twist_.linear.z = v_body.z();
-    // Yaw-rate from a constant-velocity Kalman on the unwrapped yaw. The roll /
-    // pitch rates are assumed negligible for a planar ground robot.
-    const double yaw_ref = kf_yaw_.position();
-    const double yaw_unwrapped = yaw_ref + std::remainder(yaw2 - yaw_ref, 2.0 * M_PI);
+    // Roll / pitch rates assumed negligible for a planar ground robot.
     smoothed_twist_.angular.x = 0.0;
     smoothed_twist_.angular.y = 0.0;
-    smoothed_twist_.angular.z = kf_yaw_.update(yaw_unwrapped, dt);
+    smoothed_twist_.angular.z = kf_yaw_.velocity();
   } else {  // "ema": finite difference (body frame) + exponential moving average
     tf2::Transform p1;
     tf2::fromMsg(prev_pose_.pose, p1);
@@ -317,6 +359,28 @@ void LocalizationNode::compute_odometry(
   }
 
   odom_msg->twist.twist = smoothed_twist_;
+
+  // While coasting on a gated sample, the filtered topic reports the predicted
+  // (map-frame) pose instead of the rejected raw measurement, so a swap/teleport
+  // does not leak into the position. Roll/pitch are dropped (planar coast).
+  if (velocity_filter_ == "kalman" && coast_count_ > 0) {
+    tf2::Transform pred;
+    pred.setOrigin(tf2::Vector3(kf_x_.position(), kf_y_.position(), kf_z_.position()));
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, kf_yaw_.position());
+    pred.setRotation(q);
+    tf2::toMsg(pred, filtered_pose_);
+  }
+
+  // Inflate the reported covariance while coasting on gated samples so
+  // downstream consumers can down-weight a velocity that is being extrapolated.
+  if (coast_count_ > 0) {
+    const double infl = 1.0 + coast_count_;
+    for (size_t i = 0; i < 6; i++) {
+      odom_msg->pose.covariance[i * 6 + i] *= infl;
+      odom_msg->twist.covariance[i * 6 + i] *= infl;
+    }
+  }
 
   // Advance the previous pose only after a successful update.
   prev_pose_.header = odom_msg->header;

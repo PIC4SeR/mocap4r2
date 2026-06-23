@@ -53,16 +53,15 @@ public:
     P01_ = 0.0;
     P10_ = 0.0;
     P11_ = 1.0;
-    initialized_ = true;
   }
 
-  // Fuse a new position measurement taken dt seconds after the previous one.
-  // Returns the updated velocity estimate. dt must be > 0.
-  double update(double z, double dt)
+  // Time update: propagate state and covariance by dt (> 0). Call before
+  // innovation_sq()/correct(). Coasting (predict without correct) grows the
+  // covariance, which widens the gate and lets a track re-acquire.
+  void predict(double dt)
   {
-    // Predict: x = F x, with F = [[1, dt], [0, 1]].
+    // x = F x, with F = [[1, dt], [0, 1]].
     x_p_ += dt * x_v_;
-
     // P = F P F^T + Q
     const double dt2 = dt * dt;
     const double dt3 = dt2 * dt;
@@ -75,16 +74,26 @@ public:
     P01_ = P01 + q_ * dt2 / 2.0;
     P10_ = P10 + q_ * dt2 / 2.0;
     P11_ = P11 + q_ * dt;
+  }
 
-    // Update with measurement z (H = [1, 0]).
+  // Squared Mahalanobis innovation y^2/S for measurement z (call after
+  // predict()). Compare against a chi-square threshold to gate outliers.
+  double innovation_sq(double z) const
+  {
+    const double S = P00_ + r_;
+    const double y = z - x_p_;
+    return (y * y) / S;
+  }
+
+  // Measurement update with z (H = [1, 0]); call after predict().
+  void correct(double z)
+  {
     const double S = P00_ + r_;
     const double K0 = P00_ / S;
     const double K1 = P10_ / S;
     const double y = z - x_p_;
     x_p_ += K0 * y;
     x_v_ += K1 * y;
-
-    // P = (I - K H) P
     const double nP00 = (1.0 - K0) * P00_;
     const double nP01 = (1.0 - K0) * P01_;
     const double nP10 = P10_ - K1 * P00_;
@@ -93,13 +102,10 @@ public:
     P01_ = nP01;
     P10_ = nP10;
     P11_ = nP11;
-
-    return x_v_;
   }
 
   double position() const {return x_p_;}
   double velocity() const {return x_v_;}
-  bool initialized() const {return initialized_;}
 
 private:
   double q_;
@@ -110,7 +116,6 @@ private:
   double P01_{0.0};
   double P10_{0.0};
   double P11_{0.0};
-  bool initialized_{false};
 };
 
 }  // namespace mocap4r2_filters

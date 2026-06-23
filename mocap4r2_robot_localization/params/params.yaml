@@ -19,4 +19,6 @@
       velocity_filter: 'ema'
       # alpha: 0.1 # for exponential moving average
       kalman_process_noise: 1.0        # accel spectral density; larger = more responsive
-      kalman_measurement_noise: 0.0001  # mocap position variance (m^2); larger = smoother
+      kalman_measurement_noise: 0.01    # smoothing knob (larger = smoother); 0.01-0.05 validated on prova_vicon
+      kalman_gate: 25.0                # chi-square gate on (x,y) innovation; 0 disables. 25 (2-DOF) rejects gross swaps/teleports, validated on prova_vicon
+      kalman_max_coast: 10             # force track re-acquire after this many consecutive gated samples

@@ -7,8 +7,9 @@
       robot_frame: 'base_link'
       mocap_frame: 'base_mocap_link'
       rigid_body_name: 'Jackal.Jackal'
-      rigid_body_topic: '/rigid_bodies'
-      odometry_topic: '/vicon/odom'
+      rigid_body_topic: '/rigid_bodies'   # absolute: shared mocap input, same for every robot
+      odometry_topic: 'vicon/odom'             # relative: lands under the node namespace (multirobot)
+      odometry_filtered_topic: 'vicon/odom_filtered'  # relative: same reason
       init_root2map_xyzrpy: [2.2078, 1.791, 0.0, 0.0, 0.0, 0.0] # for the covivio-v1 map
       covariance:
         pose: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
@@ -16,7 +17,7 @@
       # Velocity estimation: 'ema' (finite difference + exponential moving
       # average, smoothed by alpha) or 'kalman' (constant-velocity Kalman filter
       # on the map-frame position + yaw, tuned by the kalman_* gains below).
-      velocity_filter: 'ema'
+      velocity_filter: 'kalman'
       # alpha: 0.1 # for exponential moving average
       kalman_process_noise: 1.0        # accel spectral density; larger = more responsive
       kalman_measurement_noise: 0.01    # smoothing knob (larger = smoother); 0.01-0.05 validated on prova_vicon

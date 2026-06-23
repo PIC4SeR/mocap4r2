@@ -50,7 +50,7 @@ LocalizationNode::LocalizationNode(const rclcpp::NodeOptions & options)
   declare_parameter<std::string>("mocap_frame", "base_mocap");
   declare_parameter<std::string>("rigid_body_topic", "rigid_bodies");
   declare_parameter<std::string>("odometry_topic", "odometry");
-  declare_parameter<std::string>("odometry_filtered_topic", "/vicon/odom_filtered");
+  declare_parameter<std::string>("odometry_filtered_topic", "odom_filtered");
   declare_parameter<std::string>("rigid_body_name", "robot");
   declare_parameter<double>("alpha", 0.1);
   declare_parameter<std::string>("velocity_filter", "ema");

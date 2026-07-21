@@ -6,6 +6,7 @@
       rigid_body_prefix: 'U_'
       rigid_body_topic: '/rigid_bodies'
       people_topic: 'vicon/people'
+      people_filtered_topic: 'vicon/people_filtered'
       # Velocity estimation: 'ema' (finite difference + exponential moving
       # average, smoothed by alpha) or 'kalman' (per-person constant-velocity
       # Kalman filter, tuned by kalman_process_noise / kalman_measurement_noise).

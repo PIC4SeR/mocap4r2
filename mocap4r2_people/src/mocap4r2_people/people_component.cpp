@@ -47,7 +47,7 @@ PeopleNode::PeopleNode(const rclcpp::NodeOptions & options)
   declare_parameter<std::string>("map_frame", "map");
   declare_parameter<std::string>("rigid_body_topic", "rigid_bodies");
   declare_parameter<std::string>("people_topic", "people");
-  declare_parameter<std::string>("people_filtered_topic", "/vicon/people_filtered");
+  declare_parameter<std::string>("people_filtered_topic", "vicon/people_filtered");
   declare_parameter<std::string>("rigid_body_prefix", "person");
   declare_parameter<int>("tag.id", 0);
   declare_parameter<int>("tag.group_id", -1);

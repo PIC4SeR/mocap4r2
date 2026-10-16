@@ -36,7 +36,7 @@ using std::placeholders::_1;
 using std::placeholders::_2;
 
 LocalizationNode::LocalizationNode(const rclcpp::NodeOptions & options)
-: Node("mocap4r2_gt", options),
+: Node("mocap4r2_localization", options),
   tf_buffer_(),
   tf_listener_(tf_buffer_)
 {

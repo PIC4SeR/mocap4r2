@@ -136,23 +136,30 @@ LocalizationNode::rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::S
       });
       
     mocap4r2_msgs::msg::RigidBody::SharedPtr valid_rb;
+    // Only ever dereference robot_it after checking it against end(): a subject
+    // missing from the frame used to be read before that check.
+    const bool found = robot_it != msg->rigidbodies.end();
+    // The subject is in the frame but untracked (occluded): its last pose is
+    // re-used for the map->odom TF only. The odometry topics are NOT published
+    // with it, so their consumers (the swarm workers' stale-pose hold) see the
+    // pose age instead of a frozen pose under a fresh stamp.
+    bool reused = false;
 
-    RCLCPP_DEBUG(get_logger(), "pose x: %f, y: %f, z: %f", robot_it->pose.position.x, robot_it->pose.position.y, robot_it->pose.position.z);
-    RCLCPP_DEBUG(get_logger(), "pose qx: %f, qy: %f, qz: %f, qw: %f", robot_it->pose.orientation.x, robot_it->pose.orientation.y, robot_it->pose.orientation.z, robot_it->pose.orientation.w);   
-    RCLCPP_DEBUG(get_logger(), "is uninitialized: %d", this->is_uninitialized(robot_it->pose));
-    if (robot_it != msg->rigidbodies.end() &&
-      (this->is_uninitialized(robot_it->pose) == false))
-    {
+    if (found) {
+      RCLCPP_DEBUG(get_logger(), "pose x: %f, y: %f, z: %f", robot_it->pose.position.x, robot_it->pose.position.y, robot_it->pose.position.z);
+      RCLCPP_DEBUG(get_logger(), "pose qx: %f, qy: %f, qz: %f, qw: %f", robot_it->pose.orientation.x, robot_it->pose.orientation.y, robot_it->pose.orientation.z, robot_it->pose.orientation.w);
+      RCLCPP_DEBUG(get_logger(), "is uninitialized: %d", this->is_uninitialized(robot_it->pose));
+    }
+    if (found && !this->is_uninitialized(robot_it->pose)) {
       RCLCPP_DEBUG(get_logger(), "Rigid body %s found in mocap system", rigid_body_name_.c_str());
       valid_rb = std::make_shared<mocap4r2_msgs::msg::RigidBody>(*robot_it);
       last_valid_rigid_body_ = valid_rb;
     }
-    else if (
-      this->is_uninitialized(robot_it->pose) && last_valid_rigid_body_ != nullptr
-      )
+    else if (found && last_valid_rigid_body_ != nullptr)
     {
       RCLCPP_WARN(get_logger(), "Reusing last valid rigid body data for %s", rigid_body_name_.c_str());
       valid_rb = last_valid_rigid_body_;
+      reused = true;
     }
     else
     {
@@ -185,6 +192,16 @@ LocalizationNode::rigid_bodies_callback(const mocap4r2_msgs::msg::RigidBodies::S
 
     map2odom = map2root_ * root2mocap_ * mocap2odom;
     map2robot = map2root_ * root2mocap_ * mocap2robot_; 
+
+    if (reused) {
+      geometry_msgs::msg::TransformStamped map2odom_msg;
+      map2odom_msg.header.frame_id = map_frame_;
+      map2odom_msg.header.stamp = msg->header.stamp;
+      map2odom_msg.child_frame_id = odom_frame_;
+      map2odom_msg.transform = tf2::toMsg(map2odom);
+      tf_broadcaster_->sendTransform(map2odom_msg);
+      return;
+    }
 
     auto odom_msg = std::make_unique<nav_msgs::msg::Odometry>();
     odom_msg->header.frame_id = map_frame_;
